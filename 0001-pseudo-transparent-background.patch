@@ -1,0 +1,726 @@
+diff --git a/glfw/glfw.py b/glfw/glfw.py
+index db2c8c7ac..3eb201b39 100755
+--- a/glfw/glfw.py
++++ b/glfw/glfw.py
+@@ -91,6 +91,8 @@ def generate_wrappers(glfw_header: str) -> None:
+     GLFWcocoarenderframefun glfwCocoaSetWindowResizeCallback(GLFWwindow *w, GLFWcocoarenderframefun callback)
+     void* glfwGetX11Display(void)
+     unsigned long glfwGetX11Window(GLFWwindow* window)
++    unsigned char* glfwGetX11Wallpaper(int *width, int *height)
++    void glfwSetX11WallpaperChangeCallback(GLFWx11wallpaperchangefun callback)
+     void glfwSetPrimarySelectionString(GLFWwindow* window, const char* string)
+     void glfwCocoaCycleThroughOSWindows(bool backwards)
+     void glfwCocoaSetWindowChrome(GLFWwindow* window, unsigned int color, bool use_system_color, unsigned int system_color,\
+@@ -154,6 +156,7 @@ def generate_wrappers(glfw_header: str) -> None:
+ typedef bool (* GLFWcocoatogglefullscreenfun)(GLFWwindow*);
+ typedef void (* GLFWcocoarenderframefun)(GLFWwindow*);
+ typedef void (*GLFWwaylandframecallbackfunc)(unsigned long long id);
++typedef void (*GLFWx11wallpaperchangefun)(void);
+ typedef void (*GLFWDBusnotificationcreatedfun)(unsigned long long, uint32_t, void*);
+ typedef void (*GLFWDBusnotificationactivatedfun)(uint32_t, int, const char*);
+ {}
+diff --git a/glfw/x11_init.c b/glfw/x11_init.c
+index 554fb1e66..ef764fca5 100644
+--- a/glfw/x11_init.c
++++ b/glfw/x11_init.c
+@@ -727,6 +727,9 @@ _glfwPlatformInit(bool *supports_window_occlusion) {
+     _glfw.x11.root = RootWindow(_glfw.x11.display, _glfw.x11.screen);
+     _glfw.x11.context = XUniqueContext();
+     _glfw.x11.RESOURCE_MANAGER = XInternAtom(_glfw.x11.display, "RESOURCE_MANAGER", True);
++    // created if needed so that the wallpaper being set for the first time is noticed
++    _glfw.x11.XROOTPMAP_ID = XInternAtom(_glfw.x11.display, "_XROOTPMAP_ID", False);
++    _glfw.x11.ESETROOT_PMAP_ID = XInternAtom(_glfw.x11.display, "ESETROOT_PMAP_ID", False);
+     _glfw.x11._KDE_NET_WM_BLUR_BEHIND_REGION = None;
+     XSelectInput(_glfw.x11.display, _glfw.x11.root, PropertyChangeMask);
+ 
+diff --git a/glfw/x11_platform.h b/glfw/x11_platform.h
+index acdba819f..6e45e584b 100644
+--- a/glfw/x11_platform.h
++++ b/glfw/x11_platform.h
+@@ -361,6 +361,8 @@ typedef struct _GLFWlibraryX11 {
+ 
+     // XRM database atom
+     Atom RESOURCE_MANAGER;
++    // root window properties naming the pixmap holding the wallpaper
++    Atom XROOTPMAP_ID, ESETROOT_PMAP_ID;
+     // KDE window blur
+     Atom _KDE_NET_WM_BLUR_BEHIND_REGION;
+     // Atoms for MIME types
+@@ -528,6 +530,8 @@ typedef struct _GLFWlibraryX11 {
+ 
+     EventLoopData eventLoopData;
+ 
++    void (*wallpaper_change_callback)(void);
++
+ } _GLFWlibraryX11;
+ 
+ // X11-specific per-monitor data
+diff --git a/glfw/x11_window.c b/glfw/x11_window.c
+index 5c50b4942..22e361349 100644
+--- a/glfw/x11_window.c
++++ b/glfw/x11_window.c
+@@ -1795,6 +1795,12 @@ processEvent(XEvent *event) {
+         return;
+     }
+ 
++    if (event->type == PropertyNotify && event->xproperty.window == _glfw.x11.root &&
++        (event->xproperty.atom == _glfw.x11.XROOTPMAP_ID || event->xproperty.atom == _glfw.x11.ESETROOT_PMAP_ID)) {
++        if (_glfw.x11.wallpaper_change_callback) _glfw.x11.wallpaper_change_callback();
++        return;
++    }
++
+     if (event->type == GenericEvent) {
+         if (_glfw.x11.xi.available && event->xcookie.extension == _glfw.x11.xi.majorOpcode) {
+             if (XGetEventData(_glfw.x11.display, &event->xcookie)) {
+@@ -3430,6 +3436,70 @@ glfwGetX11Display(void) {
+     return _glfw.x11.display;
+ }
+ 
++GLFWAPI unsigned char *
++glfwGetX11Wallpaper(int *width, int *height) {
++    // The wallpaper as 4 byte per pixel RGBA data, taken from the pixmap that the
++    // desktop's wallpaper tool leaves on the root window. It covers the whole X
++    // screen. Returns NULL if there is no wallpaper or it cannot be read. The
++    // caller must free() the data.
++    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
++    const Atom properties[] = {_glfw.x11.XROOTPMAP_ID, _glfw.x11.ESETROOT_PMAP_ID};
++    for (size_t i = 0; i < arraysz(properties); i++) {
++        unsigned char *value = NULL;
++        if (_glfwGetWindowPropertyX11(_glfw.x11.root, properties[i], XA_PIXMAP, &value) != 1 || !value) {
++            if (value) XFree(value);
++            continue;
++        }
++        const Pixmap pixmap = *(Pixmap *)value;
++        XFree(value);
++        // the wallpaper tool may have freed the pixmap, in which case X reports an error
++        Window root;
++        int x, y;
++        unsigned w, h, border, depth;
++        _glfwGrabErrorHandlerX11();
++        const Status ok = XGetGeometry(_glfw.x11.display, pixmap, &root, &x, &y, &w, &h, &border, &depth);
++        XImage *image = ok && w && h ? XGetImage(_glfw.x11.display, pixmap, 0, 0, w, h, AllPlanes, ZPixmap) : NULL;
++        _glfwReleaseErrorHandlerX11();
++        if (!image) continue;
++        unsigned char *ans = NULL;
++        // images of pixmaps carry no channel masks, those of the screen's visual apply
++        const Visual *visual = DefaultVisual(_glfw.x11.display, _glfw.x11.screen);
++        const unsigned long masks[3] = {
++            image->red_mask ? image->red_mask : visual->red_mask,
++            image->green_mask ? image->green_mask : visual->green_mask,
++            image->blue_mask ? image->blue_mask : visual->blue_mask};
++        // only the usual 8 bits per channel layouts are supported
++        if (_glfw.x11.errorCode == Success && image->bits_per_pixel == 32 && masks[0] && masks[1] && masks[2] && (ans = malloc((size_t)w * h * 4))) {
++            unsigned shifts[3];
++            for (int c = 0; c < 3; c++) {
++                shifts[c] = 0;
++                while (!((masks[c] >> shifts[c]) & 1)) shifts[c]++;
++            }
++            unsigned char *out = ans;
++            for (unsigned row = 0; row < h; row++) {
++                for (unsigned col = 0; col < w; col++) {
++                    const unsigned long pixel = XGetPixel(image, col, row);
++                    *out++ = (pixel & masks[0]) >> shifts[0];
++                    *out++ = (pixel & masks[1]) >> shifts[1];
++                    *out++ = (pixel & masks[2]) >> shifts[2];
++                    *out++ = 0xff;
++                }
++            }
++            *width = w;
++            *height = h;
++        }
++        XDestroyImage(image);
++        if (ans) return ans;
++    }
++    return NULL;
++}
++
++GLFWAPI void
++glfwSetX11WallpaperChangeCallback(void (*callback)(void)) {
++    _GLFW_REQUIRE_INIT();
++    _glfw.x11.wallpaper_change_callback = callback;
++}
++
+ GLFWAPI unsigned long
+ glfwGetX11Window(GLFWwindow *handle) {
+     _GLFWwindow *window = (_GLFWwindow *)handle;
+diff --git a/kitty/data-types.h b/kitty/data-types.h
+index e6aa4af0d..b7eb7b6e4 100644
+--- a/kitty/data-types.h
++++ b/kitty/data-types.h
+@@ -149,6 +149,7 @@ typedef enum {
+ typedef enum { PROGRESS_BAR_HIDDEN, PROGRESS_BAR_LEFT, PROGRESS_BAR_RIGHT, PROGRESS_BAR_TOP, PROGRESS_BAR_BOTTOM } ProgressBarPosition;
+ typedef enum { PROGRESS_STATE_UNSET, PROGRESS_STATE_SET, PROGRESS_STATE_ERROR, PROGRESS_STATE_INDETERMINATE, PROGRESS_STATE_PAUSED } ProgressBarState;
+ typedef enum { TILING, SCALED, MIRRORED, CLAMPED, CENTER_CLAMPED, CENTER_SCALED } BackgroundImageLayout;
++typedef enum { BGIMAGE_ORIGIN_WINDOW, BGIMAGE_ORIGIN_MONITOR, BGIMAGE_ORIGIN_DESKTOP, BGIMAGE_ORIGIN_WALLPAPER } BackgroundImageOrigin;
+ typedef enum { PADDING_FILL_BACKGROUND, PADDING_FILL_NEIGHBORING_CELL } PaddingFillStrategy;
+ typedef struct ImageAnchorPosition {
+     float canvas_x, canvas_y, image_x, image_y;
+diff --git a/kitty/glfw-wrapper.c b/kitty/glfw-wrapper.c
+index a6ac38219..b48d56110 100644
+--- a/kitty/glfw-wrapper.c
++++ b/kitty/glfw-wrapper.c
+@@ -500,6 +500,12 @@ load_glfw(const char* path) {
+     *(void **) (&glfwGetX11Window_impl) = dlsym(handle, "glfwGetX11Window");
+     if (glfwGetX11Window_impl == NULL) dlerror(); // clear error indicator
+ 
++    *(void **) (&glfwGetX11Wallpaper_impl) = dlsym(handle, "glfwGetX11Wallpaper");
++    if (glfwGetX11Wallpaper_impl == NULL) dlerror(); // clear error indicator
++
++    *(void **) (&glfwSetX11WallpaperChangeCallback_impl) = dlsym(handle, "glfwSetX11WallpaperChangeCallback");
++    if (glfwSetX11WallpaperChangeCallback_impl == NULL) dlerror(); // clear error indicator
++
+     *(void **) (&glfwSetPrimarySelectionString_impl) = dlsym(handle, "glfwSetPrimarySelectionString");
+     if (glfwSetPrimarySelectionString_impl == NULL) dlerror(); // clear error indicator
+ 
+diff --git a/kitty/glfw-wrapper.h b/kitty/glfw-wrapper.h
+index 6e78ccfaa..e5a6cb972 100644
+--- a/kitty/glfw-wrapper.h
++++ b/kitty/glfw-wrapper.h
+@@ -1938,6 +1938,7 @@ typedef void (* GLFWapplicationwillfinishlaunchingfun)(bool);
+ typedef bool (* GLFWcocoatogglefullscreenfun)(GLFWwindow*);
+ typedef void (* GLFWcocoarenderframefun)(GLFWwindow*);
+ typedef void (*GLFWwaylandframecallbackfunc)(unsigned long long id);
++typedef void (*GLFWx11wallpaperchangefun)(void);
+ typedef void (*GLFWDBusnotificationcreatedfun)(unsigned long long, uint32_t, void*);
+ typedef void (*GLFWDBusnotificationactivatedfun)(uint32_t, int, const char*);
+ typedef int (*glfwInit_func)(monotonic_t, bool*);
+@@ -2584,6 +2585,14 @@ typedef unsigned long (*glfwGetX11Window_func)(GLFWwindow*);
+ GFW_EXTERN glfwGetX11Window_func glfwGetX11Window_impl;
+ #define glfwGetX11Window glfwGetX11Window_impl
+ 
++typedef unsigned char* (*glfwGetX11Wallpaper_func)(int*, int*);
++GFW_EXTERN glfwGetX11Wallpaper_func glfwGetX11Wallpaper_impl;
++#define glfwGetX11Wallpaper glfwGetX11Wallpaper_impl
++
++typedef void (*glfwSetX11WallpaperChangeCallback_func)(GLFWx11wallpaperchangefun);
++GFW_EXTERN glfwSetX11WallpaperChangeCallback_func glfwSetX11WallpaperChangeCallback_impl;
++#define glfwSetX11WallpaperChangeCallback glfwSetX11WallpaperChangeCallback_impl
++
+ typedef void (*glfwSetPrimarySelectionString_func)(GLFWwindow*, const char*);
+ GFW_EXTERN glfwSetPrimarySelectionString_func glfwSetPrimarySelectionString_impl;
+ #define glfwSetPrimarySelectionString glfwSetPrimarySelectionString_impl
+diff --git a/kitty/glfw.c b/kitty/glfw.c
+index 4c4e39f3c..f5c3ede56 100644
+--- a/kitty/glfw.c
++++ b/kitty/glfw.c
+@@ -307,9 +307,24 @@ cursor_active_callback(monotonic_t now) {
+     }
+ }
+ 
++static void
++wallpaper_change_callback(void) {
++    // the wallpaper is read again the next time it is needed
++    global_state.wallpaper.valid = false;
++    if (OPT(background_image_origin) == BGIMAGE_ORIGIN_WALLPAPER) {
++        for (size_t i = 0; i < global_state.num_os_windows; i++) global_state.os_windows[i].needs_render = true;
++        request_tick_callback();
++    }
++}
++
+ static void
+ window_pos_callback(GLFWwindow *window, int x UNUSED, int y UNUSED) {
+     if (!set_callback_window(window)) return;
++    // a background image laid out against the screen has to follow the window
++    if (OPT(background_image_origin) != BGIMAGE_ORIGIN_WINDOW) {
++        global_state.callback_os_window->needs_render = true;
++        request_tick_callback();
++    }
+ #ifdef __APPLE__
+     // Apple needs IME position to be accurate before the next key event
+     OSWindow *osw = global_state.callback_os_window;
+@@ -1714,6 +1729,39 @@ set_os_window_pos(OSWindow *os_window, int x, int y) {
+     glfwSetWindowPos(os_window->handle, x, y);
+ }
+ 
++unsigned
++get_os_window_monitor_rects(OSWindow *os_window, bool whole_desktop, int *window_x, int *window_y, ScreenRect *rects, unsigned capacity) {
++    // The window position and the rectangles, in screen coordinates, of each
++    // monitor the window overlaps (or the bounding box of all monitors). Returns
++    // the number of rectangles, zero when the window position is unknown, as on
++    // Wayland.
++    if (global_state.is_wayland || os_window->window_width <= 0 || os_window->window_height <= 0 || !capacity) return 0;
++    int count = 0;
++    GLFWmonitor **monitors = glfwGetMonitors(&count);
++    if (count <= 0 || !monitors) return 0;
++    glfwGetWindowPos(os_window->handle, window_x, window_y);
++    unsigned num = 0;
++    int left = INT_MAX, top = INT_MAX, right = INT_MIN, bottom = INT_MIN;
++    for (int i = 0; i < count; i++) {
++        const GLFWvidmode *mode = glfwGetVideoMode(monitors[i]);
++        if (!mode) continue;
++        int mx, my;
++        glfwGetMonitorPos(monitors[i], &mx, &my);
++        if (whole_desktop) {
++            left = MIN(left, mx);
++            top = MIN(top, my);
++            right = MAX(right, mx + mode->width);
++            bottom = MAX(bottom, my + mode->height);
++            continue;
++        }
++        const bool overlaps = mx < *window_x + os_window->window_width && *window_x < mx + mode->width && my < *window_y + os_window->window_height &&
++                              *window_y < my + mode->height;
++        if (overlaps && num < capacity) rects[num++] = (ScreenRect){mx, my, mode->width, mode->height};
++    }
++    if (whole_desktop && right > left && bottom > top) rects[num++] = (ScreenRect){left, top, right - left, bottom - top};
++    return num;
++}
++
+ static void
+ dpi_from_scale(float xscale, float yscale, double *xdpi, double *ydpi) {
+ #ifdef __APPLE__
+@@ -2326,6 +2374,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
+         glfwSetIMECursorPositionCallback(get_ime_cursor_position);
+         glfwSetIMETextAroundCursorCallback(get_ime_text_around_cursor);
+         glfwSetSystemColorThemeChangeCallback(on_system_color_scheme_change);
++        if (glfwSetX11WallpaperChangeCallback) glfwSetX11WallpaperChangeCallback(wallpaper_change_callback);
+         glfwSetClipboardLostCallback(on_clipboard_lost);
+         // Request SRGB output buffer
+         // Prevents kitty from starting on Wayland + NVIDIA, sigh: https://github.com/kovidgoyal/kitty/issues/7021
+diff --git a/kitty/options/definition.py b/kitty/options/definition.py
+index 17c720315..43d2a9d9b 100644
+--- a/kitty/options/definition.py
++++ b/kitty/options/definition.py
+@@ -2681,6 +2681,55 @@
+ :code:`tiled`, :code:`mirror-tiled`, :code:`scaled`, :code:`clamped`, :code:`centered`
+ or :code:`cscaled`. The :code:`scaled` and :code:`cscaled` values scale the image to the
+ window size, with :code:`cscaled` preserving the image aspect ratio.
++See :opt:`background_image_origin` to choose what the image is sized against.
++Note that when using :ref:`auto_color_scheme` this option is overridden by the color scheme file and must be set inside it to take effect.
++""",
++)
++
++opt(
++    'background_image_origin',
++    'window',
++    choices=('window', 'monitor', 'desktop', 'wallpaper'),
++    ctype='bgorigin',
++    long_text="""
++What the background image is laid out against. With :code:`window` (the
++default) the image is sized to and drawn inside each OS window. With
++:code:`monitor` the image is laid out against each monitor the OS window is on,
++and only the part of it underneath the window is shown, so the image appears to
++stay fixed on the screen as the window is moved, like the desktop wallpaper
++showing through a transparent window (pseudo-transparency). A window spanning
++several monitors shows each monitor's own copy of the image. With
++:code:`desktop` the image is laid out against the bounding box of all monitors,
++for a wallpaper spanning several monitors. Use the same image as your wallpaper,
++with the same layout, for the effect to line up, together with
++:opt:`background_tint` to blend in the background color. With :code:`wallpaper`
++the actual wallpaper of the desktop is used, as left on the root window by the
++program that sets it (the :code:`_XROOTPMAP_ID` property), so no image needs to
++be configured; :opt:`background_image`, :opt:`background_image_layout`,
++:opt:`background_image_margin_color` and :opt:`background_image_linear` are then
++ignored, and the image is updated when the wallpaper changes. This works only
++on X11. If there is no wallpaper, :code:`window` is used. The :code:`tiled`
++and :code:`mirror-tiled` layouts are always relative to the window. A
++:code:`clamped` image is placed at the top left of the monitor or desktop. Any
++part of a monitor or desktop not covered by the image is filled with
++:opt:`background_image_margin_color`. This needs the window's position on
++the screen, which is not available on Wayland, where all of these behave like :code:`window`.
++Note that when using :ref:`auto_color_scheme` this option is overridden by the color scheme file and must be set inside it to take effect.
++""",
++)
++
++opt(
++    'background_image_margin_color',
++    '#000000',
++    option_type='to_color',
++    ctype='color_as_int',
++    long_text="""
++The color shown where the background image does not cover the monitor or
++desktop when :opt:`background_image_origin` is :code:`monitor` or
++:code:`desktop`, for example around a :code:`centered` or :code:`clamped` image
++that is smaller than the screen. Set it to the color the desktop shows there so
++that the window matches the screen behind it. The :opt:`background_tint` is
++applied on top of it, as for the image.
+ Note that when using :ref:`auto_color_scheme` this option is overridden by the color scheme file and must be set inside it to take effect.
+ """,
+ )
+diff --git a/kitty/options/parse.py b/kitty/options/parse.py
+index c6008553d..d9ebd34a3 100644
+--- a/kitty/options/parse.py
++++ b/kitty/options/parse.py
+@@ -95,6 +95,17 @@ def background_image_layout(self, val: str, ans: dict[str, typing.Any]) -> None:
+     def background_image_linear(self, val: str, ans: dict[str, typing.Any]) -> None:
+         ans['background_image_linear'] = to_bool(val)
+ 
++    def background_image_margin_color(self, val: str, ans: dict[str, typing.Any]) -> None:
++        ans['background_image_margin_color'] = to_color(val)
++
++    def background_image_origin(self, val: str, ans: dict[str, typing.Any]) -> None:
++        val = val.lower()
++        if val not in self.choices_for_background_image_origin:
++            raise ValueError(f"The value {val} is not a valid choice for background_image_origin")
++        ans["background_image_origin"] = val
++
++    choices_for_background_image_origin = frozenset(('window', 'monitor', 'desktop', 'wallpaper'))
++
+     def background_opacity(self, val: str, ans: dict[str, typing.Any]) -> None:
+         ans['background_opacity'] = unit_float(val)
+ 
+diff --git a/kitty/options/to-c-generated.h b/kitty/options/to-c-generated.h
+index 1741319a9..1370e8ed6 100644
+--- a/kitty/options/to-c-generated.h
++++ b/kitty/options/to-c-generated.h
+@@ -1278,6 +1278,32 @@ convert_from_opts_background_image_layout(PyObject *py_opts, Options *opts) {
+     Py_DECREF(ret);
+ }
+ 
++static void
++convert_from_python_background_image_origin(PyObject *val, Options *opts) {
++    opts->background_image_origin = bgorigin(val);
++}
++
++static void
++convert_from_opts_background_image_origin(PyObject *py_opts, Options *opts) {
++    PyObject *ret = PyObject_GetAttrString(py_opts, "background_image_origin");
++    if (ret == NULL) return;
++    convert_from_python_background_image_origin(ret, opts);
++    Py_DECREF(ret);
++}
++
++static void
++convert_from_python_background_image_margin_color(PyObject *val, Options *opts) {
++    opts->background_image_margin_color = color_as_int(val);
++}
++
++static void
++convert_from_opts_background_image_margin_color(PyObject *py_opts, Options *opts) {
++    PyObject *ret = PyObject_GetAttrString(py_opts, "background_image_margin_color");
++    if (ret == NULL) return;
++    convert_from_python_background_image_margin_color(ret, opts);
++    Py_DECREF(ret);
++}
++
+ static void
+ convert_from_python_background_image_linear(PyObject *val, Options *opts) {
+     opts->background_image_linear = PyObject_IsTrue(val);
+@@ -1775,6 +1801,10 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
+     if (PyErr_Occurred()) return false;
+     convert_from_opts_background_image_layout(py_opts, opts);
+     if (PyErr_Occurred()) return false;
++    convert_from_opts_background_image_origin(py_opts, opts);
++    if (PyErr_Occurred()) return false;
++    convert_from_opts_background_image_margin_color(py_opts, opts);
++    if (PyErr_Occurred()) return false;
+     convert_from_opts_background_image_linear(py_opts, opts);
+     if (PyErr_Occurred()) return false;
+     convert_from_opts_background_tint(py_opts, opts);
+diff --git a/kitty/options/to-c.h b/kitty/options/to-c.h
+index d1717c756..b3010f61d 100644
+--- a/kitty/options/to-c.h
++++ b/kitty/options/to-c.h
+@@ -158,6 +158,18 @@ bglayout(PyObject *layout_name) {
+     return TILING;
+ }
+ 
++static inline BackgroundImageOrigin
++bgorigin(PyObject *origin_name) {
++    const char *name = PyUnicode_AsUTF8(origin_name);
++    switch (name[0]) {
++        case 'm': return BGIMAGE_ORIGIN_MONITOR;
++        case 'd': return BGIMAGE_ORIGIN_DESKTOP;
++        case 'w': return name[1] == 'a' ? BGIMAGE_ORIGIN_WALLPAPER : BGIMAGE_ORIGIN_WINDOW;
++        default: break;
++    }
++    return BGIMAGE_ORIGIN_WINDOW;
++}
++
+ static inline PaddingFillStrategy
+ padding_fill_strategy(PyObject *val) {
+     const char *name = PyUnicode_AsUTF8(val);
+diff --git a/kitty/options/types.py b/kitty/options/types.py
+index 4d7f5cdca..a389b2e1f 100644
+--- a/kitty/options/types.py
++++ b/kitty/options/types.py
+@@ -21,6 +21,7 @@
+ choices_for_allow_cloning = typing.Literal['yes', 'y', 'true', 'no', 'n', 'false', 'ask']
+ choices_for_allow_remote_control = typing.Literal['password', 'socket-only', 'socket', 'no', 'n', 'false', 'yes', 'y', 'true']
+ choices_for_background_image_layout = typing.Literal['mirror-tiled', 'scaled', 'tiled', 'clamped', 'centered', 'cscaled']
++choices_for_background_image_origin = typing.Literal['window', 'monitor', 'desktop', 'wallpaper']
+ choices_for_default_pointer_shape = typing.Literal['arrow', 'beam', 'text', 'pointer', 'hand', 'help', 'wait', 'progress', 'crosshair', 'cell', 'vertical-text', 'move', 'e-resize', 'ne-resize', 'nw-resize', 'n-resize', 'se-resize', 'sw-resize', 's-resize', 'w-resize', 'ew-resize', 'ns-resize', 'nesw-resize', 'nwse-resize', 'zoom-in', 'zoom-out', 'alias', 'copy', 'not-allowed', 'no-drop', 'grab', 'grabbing']
+ choices_for_focus_follows_mouse = typing.Literal['no', 'n', 'false', 'y', 'yes', 'true', 'drop']
+ choices_for_linux_display_server = typing.Literal['auto', 'wayland', 'x11']
+@@ -61,6 +62,8 @@
+     'background_image',
+     'background_image_layout',
+     'background_image_linear',
++    'background_image_margin_color',
++    'background_image_origin',
+     'background_opacity',
+     'background_tint',
+     'background_tint_gaps',
+@@ -547,6 +550,8 @@ class Options:
+     background_image: tuple[str, ...] = ()
+     background_image_layout: choices_for_background_image_layout = 'tiled'
+     background_image_linear: bool = False
++    background_image_margin_color: Color = Color(0, 0, 0)
++    background_image_origin: choices_for_background_image_origin = 'window'
+     background_opacity: float = 1.0
+     background_tint: float = 0
+     background_tint_gaps: float = 1.0
+@@ -1459,6 +1464,7 @@ def __setattr__(self, key: str, val: typing.Any) -> typing.Any:
+     'tab_bar_margin_color',
+     'foreground',
+     'background',
++    'background_image_margin_color',
+     'selection_foreground',
+     'selection_background',
+     'color0',
+diff --git a/kitty/shaders.c b/kitty/shaders.c
+index 9bf533657..69abfde92 100644
+--- a/kitty/shaders.c
++++ b/kitty/shaders.c
+@@ -2557,6 +2557,120 @@ draw_cursor_trail(CursorTrail *trail, Window *active_window) {
+ // }}}
+ 
+ // OSWindow {{{
++bool
++texture_size_supported(unsigned width, unsigned height) {
++    GLint limit = 0;
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &limit);
++    return width <= (unsigned)limit && height <= (unsigned)limit;
++}
++
++static void
++screen_aligned_bg_image_rect(
++    const OSWindow *w,
++    BackgroundImageLayout layout,
++    GLfloat iwidth,
++    GLfloat iheight,
++    int wx,
++    int wy,
++    ScreenRect area,
++    GLfloat *left,
++    GLfloat *top,
++    GLfloat *right,
++    GLfloat *bottom) {
++    // The rectangle (in NDC) occupied by the image when laid out against area (in
++    // screen coordinates) instead of against the window. The calculation is in
++    // framebuffer pixels relative to the window's top left.
++    const GLfloat sx = (GLfloat)w->viewport_width / w->window_width, sy = (GLfloat)w->viewport_height / w->window_height;
++    const GLfloat area_x = (area.x - wx) * sx, area_y = (area.y - wy) * sy, area_w = area.width * sx, area_h = area.height * sy;
++    GLfloat x = area_x, y = area_y, width = area_w, height = area_h;
++    switch (layout) {
++        case TILING:
++        case MIRRORED:
++        case SCALED: break;
++        case CENTER_SCALED: {
++            const GLfloat ifrac = iwidth / iheight;
++            if (ifrac > area_w / area_h) {
++                height = area_h;
++                width = height * ifrac;
++            } else {
++                width = area_w;
++                height = width / ifrac;
++            }
++            x += (area_w - width) / 2;
++            y += (area_h - height) / 2;
++        } break;
++        case CENTER_CLAMPED:
++            width = iwidth;
++            height = iheight;
++            x += (area_w - width) / 2;
++            y += (area_h - height) / 2;
++            break;
++        case CLAMPED:
++            width = iwidth;
++            height = iheight;
++            break;
++    }
++    *left = -1.f + 2.f * x / w->viewport_width;
++    *right = -1.f + 2.f * (x + width) / w->viewport_width;
++    *top = 1.f - 2.f * y / w->viewport_height;
++    *bottom = 1.f - 2.f * (y + height) / w->viewport_height;
++}
++
++static bool
++draw_bg_image_on_monitors(
++    OSWindow *os_window, Tab *tab, const BackgroundImage *bg, BackgroundImageLayout layout, const BackgroundImageRenderSettings *s, bool is_wallpaper) {
++    // Draws the image laid out against each monitor the window overlaps (or the
++    // whole desktop), so that it appears fixed on the screen as the window moves.
++    // The desktop wallpaper already covers the whole screen, so it is drawn as is.
++    // Returns false, drawing nothing, if the window position is not known.
++    enum { MAX_MONITOR_RECTS = 16 };
++    ScreenRect rects[MAX_MONITOR_RECTS];
++    int wx, wy;
++    unsigned num_rects;
++    if (is_wallpaper) {
++        get_os_window_pos(os_window, &wx, &wy);
++        rects[0] = (ScreenRect){0, 0, bg->width, bg->height};
++        num_rects = 1;
++        layout = CLAMPED;
++    } else {
++        num_rects = get_os_window_monitor_rects(os_window, OPT(background_image_origin) == BGIMAGE_ORIGIN_DESKTOP, &wx, &wy, rects, MAX_MONITOR_RECTS);
++    }
++    if (!num_rects) return false;
++    // altough we dont use this VO we need to ensure *some* VAO is bound at this point.
++    bind_vertex_array(tab->border_rects.vao_idx);
++    if (!is_wallpaper) {
++        // fill what the image does not cover
++        bind_program(TINT_PROGRAM);
++        color_vec4_premult(program_uniform_location(TINT_PROGRAM, "tint_color"), OPT(background_image_margin_color), 1.f);
++        glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), -1, 1, 1, -1);
++        draw_quad(false, 0);
++    }
++    bind_program(BGIMAGE_PROGRAM);
++    glUniform4f(program_uniform_location(BGIMAGE_PROGRAM, "sizes"), s->os_window.width, s->os_window.height, bg->width, bg->height);
++    glUniform1f(program_uniform_location(BGIMAGE_PROGRAM, "tiled"), 0.f);
++    glUniform1i(program_uniform_location(BGIMAGE_PROGRAM, "image"), GRAPHICS_UNIT);
++    color_vec4(program_uniform_location(BGIMAGE_PROGRAM, "background"), s->bgcolor, s->opacity);
++    glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
++    glBindTexture(GL_TEXTURE_2D, bg->texture_id);
++    const GLfloat sx = (GLfloat)os_window->viewport_width / os_window->window_width, sy = (GLfloat)os_window->viewport_height / os_window->window_height;
++    glEnable(GL_SCISSOR_TEST);
++    for (unsigned i = 0; i < num_rects; i++) {
++        GLfloat left, top, right, bottom;
++        screen_aligned_bg_image_rect(os_window, layout, bg->width, bg->height, wx, wy, rects[i], &left, &top, &right, &bottom);
++        glUniform4f(program_uniform_location(BGIMAGE_PROGRAM, "positions"), left, top, right, bottom);
++        // only draw on the part of the window that is on this monitor
++        const int x0 = MAX(rects[i].x, wx), x1 = MIN(rects[i].x + rects[i].width, wx + os_window->window_width);
++        const int y0 = MAX(rects[i].y, wy), y1 = MIN(rects[i].y + rects[i].height, wy + os_window->window_height);
++        const int px0 = (int)((x0 - wx) * sx + 0.5f), px1 = (int)((x1 - wx) * sx + 0.5f);
++        const int py0 = (int)((y0 - wy) * sy + 0.5f), py1 = (int)((y1 - wy) * sy + 0.5f);
++        glScissor(px0, os_window->viewport_height - py1, px1 - px0, py1 - py0);
++        draw_quad(false, 0);
++    }
++    glDisable(GL_SCISSOR_TEST);
++    unbind_program();
++    return true;
++}
++
+ static void
+ draw_bg_image(OSWindow *os_window, Tab *tab) {
+     BackgroundImage *bg = background_image_for_os_window(os_window);
+@@ -2571,6 +2685,10 @@ draw_bg_image(OSWindow *os_window, Tab *tab) {
+         .bgcolor = OPT(background),
+         .opacity = effective_os_window_alpha(os_window),
+     };
++    const bool is_wallpaper = bg == global_state.wallpaper.image;
++    const bool screen_aligned = OPT(background_image_origin) == BGIMAGE_ORIGIN_MONITOR || OPT(background_image_origin) == BGIMAGE_ORIGIN_DESKTOP;
++    if ((is_wallpaper || (screen_aligned && layout != TILING && layout != MIRRORED)) && draw_bg_image_on_monitors(os_window, tab, bg, layout, &s, is_wallpaper))
++        return;
+     GLfloat iwidth = bg->width, iheight = bg->height;
+     GLfloat vwidth = s.os_window.width, vheight = s.os_window.height;
+     if (CENTER_SCALED == layout) {
+diff --git a/kitty/state.c b/kitty/state.c
+index da1b97dc3..3f580fd17 100644
+--- a/kitty/state.c
++++ b/kitty/state.c
+@@ -281,9 +281,47 @@ global_background_image(size_t idx) {
+     return global_state.background_images.count > idx ? global_state.background_images.images[idx] : NULL;
+ }
+ 
++static BackgroundImage *
++desktop_wallpaper(void) {
++    // The wallpaper of the X11 root window as a background image. It is read
++    // on first use and again after it changes. If it cannot be read, the
++    // previous wallpaper, if any, stays in use.
++    if (global_state.wallpaper.valid) return global_state.wallpaper.image;
++    global_state.wallpaper.valid = true;
++    int width = 0, height = 0;
++    uint8_t *bitmap = global_state.is_wayland || !glfwGetX11Wallpaper ? NULL : glfwGetX11Wallpaper(&width, &height);
++    if (!bitmap) {
++        if (!global_state.wallpaper.image)
++            log_error("Could not read the desktop wallpaper, background_image_origin wallpaper needs X11 and a wallpaper set on the root window");
++        return global_state.wallpaper.image;
++    }
++    BackgroundImage *img = NULL;
++    if (texture_size_supported(width, height)) img = calloc(1, sizeof(BackgroundImage));
++    else log_error("The wallpaper is too large to be used as a texture: %dx%d", width, height);
++    if (img) {
++        img->bitmap = bitmap;
++        img->width = width;
++        img->height = height;
++        img->id = ++bg_image_id_counter;
++        if (send_bgimage_to_gpu(CLAMPED, img)) {
++            img->refcnt = 1;
++            free_bgimage(&global_state.wallpaper.image, true);
++            global_state.wallpaper.image = img;
++        } else {
++            free_bgimage_bitmap(img);
++            free(img);
++        }
++    } else free(bitmap);
++    return global_state.wallpaper.image;
++}
++
+ BackgroundImage *
+ background_image_for_os_window(OSWindow *w) {
+     if (w->background_image.no_image) return NULL;
++    if (OPT(background_image_origin) == BGIMAGE_ORIGIN_WALLPAPER) {
++        BackgroundImage *wallpaper = desktop_wallpaper();
++        if (wallpaper) return wallpaper;
++    }
+     if (w->background_image.override) return w->background_image.override;
+     BackgroundImage *ans = NULL;
+     if (w->background_image.global_bg_images_idx && (ans = global_background_image(w->background_image.global_bg_images_idx))) return ans;
+diff --git a/kitty/state.h b/kitty/state.h
+index a945bfe09..a6ed99c95 100644
+--- a/kitty/state.h
++++ b/kitty/state.h
+@@ -108,6 +108,8 @@ typedef struct Options {
+         unsigned generation;
+     } background_images;
+     BackgroundImageLayout background_image_layout;
++    BackgroundImageOrigin background_image_origin;
++    color_type background_image_margin_color;
+     PaddingFillStrategy padding_fill_strategy;
+     ImageAnchorPosition window_logo_position;
+     bool background_image_linear;
+@@ -725,6 +727,10 @@ typedef struct GlobalState {
+         uint32_t texture_a_id, texture_a_fbo_id;
+         uint32_t texture_b_id, texture_b_fbo_id;
+     } layers_render_texture;
++    struct {
++        BackgroundImage *image;
++        bool valid; // false when it must be read again from the X server
++    } wallpaper;
+ } GlobalState;
+ 
+ extern GlobalState global_state;
+@@ -755,6 +761,11 @@ void set_os_window_size(OSWindow *os_window, int x, int y);
+ void get_os_window_size(OSWindow *os_window, int *w, int *h, int *fw, int *fh);
+ void get_os_window_pos(OSWindow *os_window, int *x, int *y);
+ void set_os_window_pos(OSWindow *os_window, int x, int y);
++typedef struct ScreenRect {
++    int x, y, width, height;
++} ScreenRect;
++bool texture_size_supported(unsigned width, unsigned height);
++unsigned get_os_window_monitor_rects(OSWindow *os_window, bool whole_desktop, int *window_x, int *window_y, ScreenRect *rects, unsigned capacity);
+ void get_os_window_content_scale(OSWindow *os_window, double *xdpi, double *ydpi, float *xscale, float *yscale);
+ void update_os_window_references(void);
+ void mark_os_window_for_close(OSWindow *w, CloseRequest cr);
+diff --git a/kitty_tests/options.py b/kitty_tests/options.py
+index 8fab9aa6a..41c8f8e39 100644
+--- a/kitty_tests/options.py
++++ b/kitty_tests/options.py
+@@ -595,6 +595,16 @@ def ef(spec, tests, only_single=True, duration=0.5, accuracy=0):
+     self.ae(opts.background_blur, 77)
+     self.ae(opts.background_image_linear, True)
+     self.ae(opts.background_image_layout, 'clamped')
++
++    # background image origin and margin color
++    opts = p('background_image_origin monitor', 'background_image_margin_color #123456', num_err=0)
++    self.ae(opts.background_image_origin, 'monitor')
++    self.ae(opts.background_image_margin_color, to_color('#123456'))
++    opts = p(num_err=0)
++    self.ae(opts.background_image_origin, 'window')
++    self.ae(opts.background_image_margin_color, to_color('black'))
++    self.ae(p('background_image_origin wallpaper', num_err=0).background_image_origin, 'wallpaper')
++    p('background_image_origin screen', bad_line_num=1)
+     with open(os.path.join(self.tdir, 'a'), 'w') as a:
+         print('background red', file=a)
+         print('include b', file=a)
+diff --git a/tools/themes/collection.go b/tools/themes/collection.go
+index 885ec3315..663bac1d7 100644
+--- a/tools/themes/collection.go
++++ b/tools/themes/collection.go
+@@ -39,6 +39,7 @@ var AllColorSettingNames = map[string]bool{ // {{{
+ 	"active_tab_background":                true,
+ 	"active_tab_foreground":                true,
+ 	"background":                           true,
++	"background_image_margin_color":        true,
+ 	"bell_border_color":                    true,
+ 	"color0":                               true,
+ 	"color1":                               true,
